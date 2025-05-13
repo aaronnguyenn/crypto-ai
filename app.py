@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import requests
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
@@ -17,18 +17,18 @@ st.set_page_config(
 # Tiêu đề ứng dụng
 st.title("📊 Ứng dụng Phân tích Cryptocurrency")
 
-# Danh sách các cryptocurrency phổ biến
+# Danh sách các cryptocurrency phổ biến - ID theo CoinGecko
 cryptocurrencies = {
-    "Bitcoin": "BTC-USD",
-    "Ethereum": "ETH-USD",
-    "Binance Coin": "BNB-USD",
-    "Cardano": "ADA-USD",
-    "Solana": "SOL-USD",
-    "XRP": "XRP-USD",
-    "Polkadot": "DOT-USD", 
-    "Dogecoin": "DOGE-USD",
-    "Avalanche": "AVAX-USD",
-    "Chainlink": "LINK-USD"
+    "Bitcoin": "bitcoin",
+    "Ethereum": "ethereum",
+    "Binance Coin": "binancecoin",
+    "Cardano": "cardano",
+    "Solana": "solana",
+    "XRP": "ripple",
+    "Polkadot": "polkadot",
+    "Dogecoin": "dogecoin",
+    "Avalanche": "avalanche-2",
+    "Chainlink": "chainlink"
 }
 
 # Sidebar cho cài đặt
@@ -55,13 +55,57 @@ show_indicators = st.sidebar.checkbox("Hiển thị chỉ báo kỹ thuật", va
 # Hiển thị thông tin về cryptocurrency đã chọn
 st.header(f"{selected_crypto} ({cryptocurrencies[selected_crypto]})")
 
-# Tải dữ liệu
+# Tải dữ liệu từ CoinGecko API
 @st.cache_data(ttl=300)  # Cache trong 5 phút
-def load_data(ticker, period_days):
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=period_days)
-    df = yf.download(ticker, start=start_date, end=end_date)
-    return df
+def load_data(coin_id, days):
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+        params = {
+            'vs_currency': 'usd',
+            'days': days,
+            'interval': 'daily' if days > 90 else 'hourly'
+        }
+        
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            st.error(f"Lỗi API: {response.status_code}")
+            return pd.DataFrame()
+            
+        data = response.json()
+        
+        # Xử lý dữ liệu giá
+        prices = data.get('prices', [])
+        volumes = data.get('total_volumes', [])
+        
+        price_data = []
+        for i, (timestamp, price) in enumerate(prices):
+            dt = datetime.fromtimestamp(timestamp/1000)
+            volume = volumes[i][1] if i < len(volumes) else 0
+            price_data.append({
+                'Date': dt,
+                'Price': price,
+                'Volume': volume
+            })
+        
+        df = pd.DataFrame(price_data)
+        df.set_index('Date', inplace=True)
+        
+        # Tạo dữ liệu OHLC (CoinGecko chỉ cung cấp giá đóng cửa)
+        # Chúng ta sẽ tạo giá trị OHLC từ giá đóng cửa
+        df['Close'] = df['Price']
+        df['Open'] = df['Price'].shift(1)
+        
+        # Giá trị High và Low tạm thời (thay đổi 0.5% so với giá đóng)
+        df['High'] = df['Price'] * 1.005
+        df['Low'] = df['Price'] * 0.995
+        
+        # Điền các giá trị NA cho dòng đầu tiên
+        df['Open'].fillna(df['Close'].iloc[0], inplace=True)
+        
+        return df
+    except Exception as e:
+        st.error(f"Lỗi khi tải dữ liệu: {e}")
+        return pd.DataFrame()
 
 with st.spinner('Đang tải dữ liệu...'):
     data = load_data(cryptocurrencies[selected_crypto], time_periods[selected_period])
@@ -73,9 +117,9 @@ else:
     col1, col2, col3, col4 = st.columns(4)
     
     last_price = data['Close'].iloc[-1]
-    prev_price = data['Close'].iloc[-2]
+    prev_price = data['Close'].iloc[-2] if len(data) > 1 else last_price
     price_change = last_price - prev_price
-    price_change_pct = (price_change / prev_price) * 100
+    price_change_pct = (price_change / prev_price) * 100 if prev_price > 0 else 0
     
     col1.metric("Giá hiện tại", f"${last_price:.2f}", f"{price_change_pct:.2f}%")
     col2.metric("Giá cao nhất (24h)", f"${data['High'].iloc[-1]:.2f}")
@@ -150,7 +194,7 @@ else:
         st.plotly_chart(volume_fig, use_container_width=True)
     
     # Phân tích kỹ thuật
-    if show_indicators:
+    if show_indicators and len(data) > 14:  # Đảm bảo đủ dữ liệu cho RSI
         st.subheader("Phân tích kỹ thuật")
         
         # Tính RSI
@@ -268,15 +312,16 @@ else:
         
         for crypto in comparison_cryptos:
             comp_data = load_data(cryptocurrencies[crypto], time_periods[selected_period])
-            # Chuẩn hóa giá để so sánh hiệu suất (100 = giá ngày đầu tiên)
-            normalized_data = comp_data['Close'] / comp_data['Close'].iloc[0] * 100
-            
-            comparison_fig.add_trace(go.Scatter(
-                x=comp_data.index,
-                y=normalized_data,
-                mode='lines',
-                name=crypto
-            ))
+            if not comp_data.empty:
+                # Chuẩn hóa giá để so sánh hiệu suất (100 = giá ngày đầu tiên)
+                normalized_data = comp_data['Close'] / comp_data['Close'].iloc[0] * 100
+                
+                comparison_fig.add_trace(go.Scatter(
+                    x=comp_data.index,
+                    y=normalized_data,
+                    mode='lines',
+                    name=crypto
+                ))
         
         comparison_fig.update_layout(
             title="So sánh hiệu suất (chuẩn hóa)",
@@ -293,5 +338,6 @@ st.sidebar.markdown("---")
 st.sidebar.info("""
 **Về ứng dụng này**
 Ứng dụng này giúp phân tích giá và xu hướng của các cryptocurrency phổ biến.
+Dữ liệu được cung cấp bởi CoinGecko API.
 """)
 st.sidebar.warning("Lưu ý: Thông tin được cung cấp chỉ mang tính chất tham khảo và không phải là lời khuyên đầu tư.")
